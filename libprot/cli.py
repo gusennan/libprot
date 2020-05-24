@@ -1,18 +1,24 @@
-# -*- coding: utf-8 -*-
+import dataclasses
+import itertools
 import re
 import sys
 import typing
+from pathlib import Path
 
 import click
 import numpy as np
 import requests
-from Bio import SeqIO
-from Bio.PDB import PDBParser, Superimposer, PPBuilder
+from Bio.PDB import PDBParser, Superimposer, PPBuilder, Structure, is_aa
+from Bio.PDB.Residue import Residue as bpResidue
+from Bio.Seq import Seq
+from Bio.Alphabet import generic_protein
 from Bio.SeqRecord import SeqRecord
+from Bio.Data.IUPACData import protein_letters_3to1, protein_letters_1to3
 
-from libprot.pdb import get_amino_acids
 from libprot import amber
 from libprot.amber import ForceFieldType, reduce_pdb
+from libprot.pdb import get_amino_acids, Residue, AminoAcid
+from libprot.types import Mutation, Indel
 
 
 def error(msg):
@@ -79,30 +85,120 @@ def edit_distance(seq1, seq2):
     return mat[len(seq1), len(seq2)]
 
 
-def to_fasta_impl(structure, pdb_id, description, mutations, out_stream):
+def parse_mutations(mutations: typing.List[str]) -> typing.List[Mutation]:
+    mutations = [re.search(r'(?P<chain>\D):(?P<mut_from>\D)(?P<index>\d+)(?P<mut_to>\D)', mutation) for mutation in mutations]
+    return [Mutation(mut.group('chain'), int(mut.group('index')), mut.group('mut_from'), mut.group('mut_to')) for mut in mutations]
+
+
+def index_in_lists(seqs: typing.List[typing.Any], idx: int) -> typing.Tuple[int, int]:
+    seq_idx = 0
+    for seq in seqs:
+        try:
+            seq[idx]
+        except IndexError:
+            idx -= len(seq)
+            seq_idx += 1
+
+    return seq_idx, idx
+
+
+def index_of_resnum(resnum: int, r: typing.List[Residue]) -> int:
+    return r.index(next(filter(lambda res: res.res_num == resnum, r)))
+
+
+def mutate_residues(structure: Structure, seqs: typing.Dict[str, typing.List[Residue]], mutations: typing.List[Mutation]) -> typing.Dict[str, typing.List[Residue]]:
+
+    for mutation in mutations:
+        residues: typing.List[Residue] = seqs[mutation.chain]
+        to_replace = index_of_resnum(mutation.index, residues)
+        to_type = protein_letters_1to3[mutation.to_aa].capitalize()
+        if AminoAcid(protein_letters_1to3[mutation.from_aa].capitalize()) != residues[to_replace].aa_type:
+            raise Exception(f'Expected to mutate residue {residues[to_replace].res_num} from {mutation.from_aa} to {mutation.to_aa}, but residue had type {residues[to_replace].aa_type}')
+
+        residues[to_replace] = Residue(chain=mutation.chain, res_num=mutation.index, aa_type=AminoAcid(to_type), changed=True)
+
+    return seqs
+
+
+def parse_to_structure(path: Path) -> Structure:
+    return PDBParser(QUIET=True).get_structure(path.name, path)
+
+
+def parse_indels(indels: typing.List[str]) -> typing.List[Indel]:
+    indels = [re.search(r'(?P<chain>\D):(?P<amino_acid>\D)(?P<index>\d+)', insertion) for insertion in indels]
+    indels = [Indel(ins.group('chain'), int(ins.group('index')), ins.group('amino_acid')) for ins in indels]
+    return indels
+
+
+def add_indels(structure: Structure, residues: typing.Dict[str, typing.List[Residue]], indels: typing.List[Indel]) -> typing.Dict[str, typing.List[Residue]]:
+    """Currently only handles insertions"""
+
+    for indel in indels:
+        chain_res = residues[indel.chain]
+        index_to_insert_at = index_of_resnum(indel.index, chain_res) + 1
+        residues[indel.chain] = chain_res[:index_to_insert_at] + [Residue(chain=indel.chain, res_num=indel.index, aa_type=AminoAcid(protein_letters_1to3[indel.aa].capitalize()), changed=True)] + chain_res[index_to_insert_at:]
+
+    return residues
+
+
+def extract_seqs_from_pdb_file(path: Path) -> typing.List[Seq]:
+    return [pp.get_sequence() for pp in PPBuilder().build_peptides(parse_to_structure(path))]
+
+
+def mutate_and_indels(structure: Structure, seqs: typing.List[Seq], mutations: typing.List[Mutation], indels: typing.List[Indel]) -> typing.List[Seq]:
+    seqs = mutate_residues(structure, seqs, mutations)
+    seqs = add_indels(structure, seqs, indels)
+    return seqs
+
+
+def parse_residue(res: bpResidue) -> Residue:
+    type = res.get_resname()
+    res_num = res.get_id()[1]
+    chain = res.get_full_id()[2]
+    try:
+        return Residue(chain=chain, res_num=res_num, aa_type=AminoAcid(type.capitalize()))
+    except ValueError:
+        return Residue(chain=chain, res_num=res_num, aa_type=AminoAcid.OTHER)
+
+
+def to_list_of_residues(structure: Structure) -> typing.Dict[str, typing.List[Residue]]:
+    return {
+        chain.id: [parse_residue(res) for res in chain.get_residues()]
+        for chain in structure.get_chains()
+    }
+
+
+def to_one_letter_alphabet(residues: typing.List[Residue]) -> str:
+    return "".join([protein_letters_3to1[res.aa_type.value] for res in residues])
+
+
+def to_fasta_impl(template_pdb: Path, pdb_id: str, description: str, mutations: typing.List[str], insertions: typing.List[str], deletions: typing.List[str]) -> typing.List[typing.Tuple[SeqRecord, typing.List[Residue]]]:
     if pdb_id is None:
         pdb_id = ""
     if description is None:
         description = ""
 
-    ppb = PPBuilder()
-    seq = [pp.get_sequence() for pp in ppb.build_peptides(structure)][0]
+    seqs = extract_seqs_from_pdb_file(template_pdb)
+    structure = parse_to_structure(template_pdb)
+    residues = to_list_of_residues(structure)
 
     if mutations:
-        mut_seq = seq.tomutable()
-        mutations = [re.search(r'(?P<original>\D)(?P<index>\d+)(?P<mutation>\D)', line) for line in mutations]
-        for mut in mutations:
-            idx = int(mut.group('index')) - 1
-            old_aa = mut.group('original')
-            new_aa = mut.group('mutation')
-            if old_aa != mut_seq[idx]:
-                raise Exception(
-                    f'The amino acid in {pdb_id} at index {mut.group("index")} is {mut_seq[idx]}, not {old_aa}')
-            mut_seq[idx] = new_aa
-        seq = mut_seq.toseq()
+        residues = mutate_residues(structure, residues, parse_mutations(mutations))
 
-    sequence_record = SeqRecord(seq, id=pdb_id, description=description)
-    SeqIO.write([sequence_record], out_stream, "fasta")
+    if insertions:
+        residues = add_indels(structure, residues, list(map(lambda x: dataclasses.replace(x, type=0), parse_indels(insertions))))
+
+    if deletions:
+        seqs = add_indels(structure, seqs, list(map(lambda x: dataclasses.replace(x, type=1), parse_indels(deletions))))
+
+    for chain, chain_residues in residues.items():
+        first_idx = chain_residues[0].res_num
+        residues[chain] = [dataclasses.replace(res, res_num=idx) for idx, res in zip(range(first_idx, first_idx + len(chain_residues)), chain_residues)]
+
+    records = [(SeqRecord(Seq(to_one_letter_alphabet(seq), generic_protein),
+                         id=f'{pdb_id}-{chain}' if len(seqs) > 1 else pdb_id,
+                         description=f'{description}'), [res for res in seq if res.changed]) for chain, seq in residues.items() if chain == 'A']
+    return records
 
 
 @click.command()
@@ -119,7 +215,7 @@ def to_fasta(pdb, pdb_id, description, mut_file):
     parser = PDBParser()
     structure = parser.get_structure(pdb.replace('.pdb', ''), pdb)
 
-    to_fasta_impl(structure, pdb_id, description, mutations, sys.stdout)
+    to_fasta_impl(structure, pdb_id, description, mutations, None, None)
 
 
 @click.command()
@@ -191,6 +287,7 @@ def minimize_parameter_files(topology, coordinates, rounds):
 @click.option('--coordinates', '-c', type=click.File(mode='rb'))
 def coordinates_to_pdb(topology: typing.TextIO, coordinates: typing.BinaryIO):
     print_command_output(*amber.convert_coords_to_pdb(topology, coordinates))
+
 
 @click.command(help="Minimize a protein in a PDB file")
 @click.option('--file', '-f', type=click.File())
